@@ -1,4 +1,3 @@
-import mongoose from "mongoose";
 import { Book } from "../models/Book.js";
 import { Sale } from "../models/Sale.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -15,62 +14,81 @@ function makeFolio() {
 
 export const createSale = asyncHandler(async (req, res) => {
   const { buyerType, buyerRefId = "", items } = req.body;
+
   if (!buyerType || !Array.isArray(items) || items.length === 0) {
     throw httpError(400, "buyerType e items son obligatorios");
   }
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  const folio = makeFolio();
+  const soldAt = new Date();
+
+  // Para rollback si algo falla a media venta
+  const applied = []; // { bookId, qty }
 
   try {
-    const folio = makeFolio();
-    const soldAt = new Date();
-
-    // Validar y calcular totales
     let total = 0;
     const normalizedItems = [];
 
     for (const it of items) {
-      const { bookId, qty } = it;
-      if (!bookId || !qty || qty < 1) throw httpError(400, "items inválidos");
+      const bookId = String(it.bookId || "");
+      const qty = Number(it.qty);
 
-      const book = await Book.findById(bookId).session(session);
-      if (!book || !book.active) throw httpError(404, "Libro no válido");
-      if (book.stock < qty) throw httpError(409, `Stock insuficiente para: ${book.title}`);
+      if (!bookId || !Number.isFinite(qty) || qty < 1) {
+        throw httpError(400, "items inválidos");
+      }
 
-      const unitPrice = book.price;
+      // 1) Descontar stock de forma ATÓMICA (evita negativos sin transacción)
+      const r = await Book.updateOne(
+        { _id: bookId, active: true, stock: { $gte: qty } },
+        { $inc: { stock: -qty } }
+      );
+
+      if (r.modifiedCount !== 1) {
+        // Puede ser: no existe, inactivo o stock insuficiente
+        // Para diferenciar mensaje:
+        const book = await Book.findById(bookId).select("title active stock");
+        if (!book || !book.active) throw httpError(404, "Libro no válido");
+        throw httpError(409, `Stock insuficiente para: ${book.title}`);
+      }
+
+      applied.push({ bookId, qty });
+
+      // 2) Leer precio/título (ya que stock ya se descontó)
+      const book = await Book.findById(bookId).select("title price");
+      if (!book) throw httpError(404, "Libro no válido");
+
+      const unitPrice = Number(book.price ?? 0);
       const subtotal = unitPrice * qty;
+
       total += subtotal;
-
-      // Descontar stock
-      book.stock -= qty;
-      await book.save({ session });
-
       normalizedItems.push({ bookId, qty, unitPrice, subtotal });
     }
 
-    const sale = await Sale.create(
-      [
-        {
-          folio,
-          soldAt,
-          soldByUserId: req.user.id,
-          buyerType,
-          buyerRefId,
-          items: normalizedItems,
-          total,
-        },
-      ],
-      { session }
-    );
+    // 3) Guardar venta (sin session)
+    const sale = await Sale.create({
+      folio,
+      soldAt,
+      soldByUserId: req.user.id,
+      buyerType,
+      buyerRefId,
+      items: normalizedItems,
+      total,
+    });
 
-    await session.commitTransaction();
-    session.endSession();
-
-    res.status(201).json({ ok: true, data: sale[0] });
+    return res.status(201).json({ ok: true, data: sale });
   } catch (e) {
-    await session.abortTransaction();
-    session.endSession();
+    // Rollback manual: regresamos el stock de los libros ya descontados
+    if (applied.length > 0) {
+      await Book.bulkWrite(
+        applied.map((it) => ({
+          updateOne: {
+            filter: { _id: it.bookId },
+            update: { $inc: { stock: it.qty } },
+          },
+        })),
+        { ordered: false }
+      );
+    }
     throw e;
   }
 });
