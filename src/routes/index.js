@@ -6,6 +6,8 @@ import { studentsRoutes } from "./students.routes.js";
 import { booksRoutes } from "./books.routes.js";
 import { attendanceRoutes } from "./attendance.routes.js";
 import { salesRoutes } from "./sales.routes.js";
+import { adminUsersRoutes } from "./adminUsers.routes.js";
+
 
 export const routes = Router();
 
@@ -16,3 +18,5 @@ routes.use("/students", studentsRoutes);
 routes.use("/books", booksRoutes);
 routes.use("/attendance", attendanceRoutes);
 routes.use("/sales", salesRoutes);
+
+routes.use("/admin/users", adminUsersRoutes);
